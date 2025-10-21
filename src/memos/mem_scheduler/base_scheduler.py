@@ -1,9 +1,13 @@
+import multiprocessing
 import queue
 import threading
 import time
 
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
+
+from sqlalchemy.engine import Engine
 
 from memos.configs.mem_scheduler import AuthConfig, BaseSchedulerConfig
 from memos.llms.base import BaseLLM
@@ -11,16 +15,16 @@ from memos.log import get_logger
 from memos.mem_cube.general import GeneralMemCube
 from memos.mem_scheduler.general_modules.dispatcher import SchedulerDispatcher
 from memos.mem_scheduler.general_modules.misc import AutoDroppingQueue as Queue
-from memos.mem_scheduler.general_modules.rabbitmq_service import RabbitMQSchedulerModule
-from memos.mem_scheduler.general_modules.redis_service import RedisSchedulerModule
-from memos.mem_scheduler.general_modules.retriever import SchedulerRetriever
 from memos.mem_scheduler.general_modules.scheduler_logger import SchedulerLoggerModule
+from memos.mem_scheduler.memory_manage_modules.retriever import SchedulerRetriever
 from memos.mem_scheduler.monitors.dispatcher_monitor import SchedulerDispatcherMonitor
 from memos.mem_scheduler.monitors.general_monitor import SchedulerGeneralMonitor
 from memos.mem_scheduler.schemas.general_schemas import (
     DEFAULT_ACT_MEM_DUMP_PATH,
     DEFAULT_CONSUME_INTERVAL_SECONDS,
-    DEFAULT_THREAD__POOL_MAX_WORKERS,
+    DEFAULT_STARTUP_MODE,
+    DEFAULT_THREAD_POOL_MAX_WORKERS,
+    STARTUP_BY_PROCESS,
     MemCubeID,
     TreeTextMemory_SEARCH_METHOD,
     UserID,
@@ -33,6 +37,8 @@ from memos.mem_scheduler.schemas.monitor_schemas import MemoryMonitorItem
 from memos.mem_scheduler.utils.filter_utils import (
     transform_name_to_key,
 )
+from memos.mem_scheduler.webservice_modules.rabbitmq_service import RabbitMQSchedulerModule
+from memos.mem_scheduler.webservice_modules.redis_service import RedisSchedulerModule
 from memos.memories.activation.kv import KVCacheMemory
 from memos.memories.activation.vllmkv import VLLMKVCacheItem, VLLMKVCacheMemory
 from memos.memories.textual.tree import TextualMemoryItem, TreeTextMemory
@@ -56,28 +62,42 @@ class BaseScheduler(RabbitMQSchedulerModule, RedisSchedulerModule, SchedulerLogg
         self.enable_activation_memory = self.config.get("enable_activation_memory", False)
         self.act_mem_dump_path = self.config.get("act_mem_dump_path", DEFAULT_ACT_MEM_DUMP_PATH)
         self.search_method = TreeTextMemory_SEARCH_METHOD
-        self.enable_parallel_dispatch = self.config.get("enable_parallel_dispatch", False)
+        self.enable_parallel_dispatch = self.config.get("enable_parallel_dispatch", True)
         self.thread_pool_max_workers = self.config.get(
-            "thread_pool_max_workers", DEFAULT_THREAD__POOL_MAX_WORKERS
+            "thread_pool_max_workers", DEFAULT_THREAD_POOL_MAX_WORKERS
+        )
+
+        # startup mode configuration
+        self.scheduler_startup_mode = self.config.get(
+            "scheduler_startup_mode", DEFAULT_STARTUP_MODE
         )
 
         self.retriever: SchedulerRetriever | None = None
+        self.db_engine: Engine | None = None
         self.monitor: SchedulerGeneralMonitor | None = None
         self.dispatcher_monitor: SchedulerDispatcherMonitor | None = None
         self.dispatcher = SchedulerDispatcher(
+            config=self.config,
             max_workers=self.thread_pool_max_workers,
             enable_parallel_dispatch=self.enable_parallel_dispatch,
         )
 
+        # optional configs
+        self.disable_handlers: list | None = self.config.get("disable_handlers", None)
+
         # internal message queue
-        self.max_internal_messae_queue_size = 100
+        self.max_internal_message_queue_size = self.config.get(
+            "max_internal_message_queue_size", 100
+        )
         self.memos_message_queue: Queue[ScheduleMessageItem] = Queue(
-            maxsize=self.max_internal_messae_queue_size
+            maxsize=self.max_internal_message_queue_size
         )
+        self.max_web_log_queue_size = self.config.get("max_web_log_queue_size", 50)
         self._web_log_message_queue: Queue[ScheduleLogForWebItem] = Queue(
-            maxsize=self.max_internal_messae_queue_size
+            maxsize=self.max_web_log_queue_size
         )
-        self._consumer_thread = None  # Reference to our consumer thread
+        self._consumer_thread = None  # Reference to our consumer thread/process
+        self._consumer_process = None  # Reference to our consumer process
         self._running = False
         self._consume_interval = self.config.get(
             "consume_interval_seconds", DEFAULT_CONSUME_INTERVAL_SECONDS
@@ -92,34 +112,58 @@ class BaseScheduler(RabbitMQSchedulerModule, RedisSchedulerModule, SchedulerLogg
         self.auth_config = None
         self.rabbitmq_config = None
 
-    def initialize_modules(self, chat_llm: BaseLLM, process_llm: BaseLLM | None = None):
+    def initialize_modules(
+        self,
+        chat_llm: BaseLLM,
+        process_llm: BaseLLM | None = None,
+        db_engine: Engine | None = None,
+    ):
         if process_llm is None:
             process_llm = chat_llm
 
-        # initialize submodules
-        self.chat_llm = chat_llm
-        self.process_llm = process_llm
-        self.monitor = SchedulerGeneralMonitor(process_llm=self.process_llm, config=self.config)
-        self.dispatcher_monitor = SchedulerDispatcherMonitor(config=self.config)
-        self.retriever = SchedulerRetriever(process_llm=self.process_llm, config=self.config)
+        try:
+            # initialize submodules
+            self.chat_llm = chat_llm
+            self.process_llm = process_llm
+            self.db_engine = db_engine
+            self.monitor = SchedulerGeneralMonitor(
+                process_llm=self.process_llm, config=self.config, db_engine=self.db_engine
+            )
+            self.db_engine = self.monitor.db_engine
+            self.dispatcher_monitor = SchedulerDispatcherMonitor(config=self.config)
+            self.retriever = SchedulerRetriever(process_llm=self.process_llm, config=self.config)
 
-        if self.enable_parallel_dispatch:
-            self.dispatcher_monitor.initialize(dispatcher=self.dispatcher)
-            self.dispatcher_monitor.start()
+            if self.enable_parallel_dispatch:
+                self.dispatcher_monitor.initialize(dispatcher=self.dispatcher)
+                self.dispatcher_monitor.start()
 
-        # initialize with auth_cofig
-        if self.auth_config_path is not None and Path(self.auth_config_path).exists():
-            self.auth_config = AuthConfig.from_local_config(config_path=self.auth_config_path)
-        elif AuthConfig.default_config_exists():
-            self.auth_config = AuthConfig.from_local_config()
-        else:
-            self.auth_config = None
+            # initialize with auth_config
+            if self.auth_config_path is not None and Path(self.auth_config_path).exists():
+                self.auth_config = AuthConfig.from_local_config(config_path=self.auth_config_path)
+            elif AuthConfig.default_config_exists():
+                self.auth_config = AuthConfig.from_local_config()
+            else:
+                self.auth_config = AuthConfig.from_local_env()
 
-        if self.auth_config is not None:
-            self.rabbitmq_config = self.auth_config.rabbitmq
-            self.initialize_rabbitmq(config=self.rabbitmq_config)
+            if self.auth_config is not None:
+                self.rabbitmq_config = self.auth_config.rabbitmq
+                if self.rabbitmq_config is not None:
+                    self.initialize_rabbitmq(config=self.rabbitmq_config)
 
-        logger.debug("GeneralScheduler has been initialized")
+            logger.debug("GeneralScheduler has been initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize scheduler modules: {e}", exc_info=True)
+            # Clean up any partially initialized resources
+            self._cleanup_on_init_failure()
+            raise
+
+    def _cleanup_on_init_failure(self):
+        """Clean up resources if initialization fails."""
+        try:
+            if hasattr(self, "dispatcher_monitor") and self.dispatcher_monitor is not None:
+                self.dispatcher_monitor.stop()
+        except Exception as e:
+            logger.warning(f"Error during cleanup: {e}")
 
     @property
     def mem_cube(self) -> GeneralMemCube:
@@ -200,8 +244,11 @@ class BaseScheduler(RabbitMQSchedulerModule, RedisSchedulerModule, SchedulerLogg
             text_mem_base: TreeTextMemory = text_mem_base
 
             # process rerank memories with llm
-            query_monitor = self.monitor.query_monitors[user_id][mem_cube_id]
-            query_history = query_monitor.get_queries_with_timesort()
+            query_db_manager = self.monitor.query_monitors[user_id][mem_cube_id]
+            # Sync with database to get latest query history
+            query_db_manager.sync_with_orm()
+
+            query_history = query_db_manager.obj.get_queries_with_timesort()
             memories_with_new_order, rerank_success_flag = (
                 self.retriever.process_and_rerank_memories(
                     queries=query_history,
@@ -211,8 +258,27 @@ class BaseScheduler(RabbitMQSchedulerModule, RedisSchedulerModule, SchedulerLogg
                 )
             )
 
-            # update working memory monitors
-            query_keywords = query_monitor.get_keywords_collections()
+            # Filter completely unrelated memories according to query_history
+            logger.info(f"Filtering memories based on query history: {len(query_history)} queries")
+            filtered_memories, filter_success_flag = self.retriever.filter_unrelated_memories(
+                query_history=query_history,
+                memories=memories_with_new_order,
+            )
+
+            if filter_success_flag:
+                logger.info(
+                    f"Memory filtering completed successfully. "
+                    f"Filtered from {len(memories_with_new_order)} to {len(filtered_memories)} memories"
+                )
+                memories_with_new_order = filtered_memories
+            else:
+                logger.warning(
+                    "Memory filtering failed - keeping all memories as fallback. "
+                    f"Original count: {len(memories_with_new_order)}"
+                )
+
+            # Update working memory monitors
+            query_keywords = query_db_manager.obj.get_keywords_collections()
             logger.info(
                 f"Processing {len(memories_with_new_order)} memories with {len(query_keywords)} query keywords"
             )
@@ -235,7 +301,7 @@ class BaseScheduler(RabbitMQSchedulerModule, RedisSchedulerModule, SchedulerLogg
 
             mem_monitors: list[MemoryMonitorItem] = self.monitor.working_memory_monitors[user_id][
                 mem_cube_id
-            ].get_sorted_mem_monitors(reverse=True)
+            ].obj.get_sorted_mem_monitors(reverse=True)
             new_working_memories = [mem_monitor.tree_memory_item for mem_monitor in mem_monitors]
 
             text_mem_base.replace_working_memory(memories=new_working_memories)
@@ -278,6 +344,7 @@ class BaseScheduler(RabbitMQSchedulerModule, RedisSchedulerModule, SchedulerLogg
             new_text_memories = new_memories
         else:
             logger.error("Not Implemented.")
+            return
 
         try:
             if isinstance(mem_cube.act_mem, VLLMKVCacheMemory):
@@ -333,7 +400,9 @@ class BaseScheduler(RabbitMQSchedulerModule, RedisSchedulerModule, SchedulerLogg
             )
 
         except Exception as e:
-            logger.warning(f"MOS-based activation memory update failed: {e}", exc_info=True)
+            logger.error(f"MOS-based activation memory update failed: {e}", exc_info=True)
+            # Re-raise the exception if it's critical for the operation
+            # For now, we'll continue execution but this should be reviewed
 
     def update_activation_memory_periodically(
         self,
@@ -358,7 +427,8 @@ class BaseScheduler(RabbitMQSchedulerModule, RedisSchedulerModule, SchedulerLogg
                 if (
                     user_id not in self.monitor.working_memory_monitors
                     or mem_cube_id not in self.monitor.working_memory_monitors[user_id]
-                    or len(self.monitor.working_memory_monitors[user_id][mem_cube_id].memories) == 0
+                    or len(self.monitor.working_memory_monitors[user_id][mem_cube_id].obj.memories)
+                    == 0
                 ):
                     logger.warning(
                         "No memories found in working_memory_monitors, activation memory update is skipped"
@@ -369,9 +439,13 @@ class BaseScheduler(RabbitMQSchedulerModule, RedisSchedulerModule, SchedulerLogg
                     user_id=user_id, mem_cube_id=mem_cube_id, mem_cube=mem_cube
                 )
 
+                # Sync with database to get latest activation memories
+                activation_db_manager = self.monitor.activation_memory_monitors[user_id][
+                    mem_cube_id
+                ]
+                activation_db_manager.sync_with_orm()
                 new_activation_memories = [
-                    m.memory_text
-                    for m in self.monitor.activation_memory_monitors[user_id][mem_cube_id].memories
+                    m.memory_text for m in activation_db_manager.obj.memories
                 ]
 
                 logger.info(
@@ -412,6 +486,16 @@ class BaseScheduler(RabbitMQSchedulerModule, RedisSchedulerModule, SchedulerLogg
             messages = [messages]  # transform single message to list
 
         for message in messages:
+            if not isinstance(message, ScheduleMessageItem):
+                error_msg = f"Invalid message type: {type(message)}, expected ScheduleMessageItem"
+                logger.error(error_msg)
+                raise TypeError(error_msg)
+
+            # Check if this handler is disabled
+            if self.disable_handlers and message.label in self.disable_handlers:
+                logger.info(f"Skipping disabled handler: {message.label} - {message.content}")
+                continue
+
             self.memos_message_queue.put(message)
             logger.info(f"Submitted message: {message.label} - {message.content}")
 
@@ -423,10 +507,18 @@ class BaseScheduler(RabbitMQSchedulerModule, RedisSchedulerModule, SchedulerLogg
         Args:
             messages: Single log message or list of log messages
         """
+        if self.rabbitmq_config is None:
+            return
+
         if isinstance(messages, ScheduleLogForWebItem):
             messages = [messages]  # transform single message to list
 
         for message in messages:
+            if not isinstance(message, ScheduleLogForWebItem):
+                error_msg = f"Invalid message type: {type(message)}, expected ScheduleLogForWebItem"
+                logger.error(error_msg)
+                raise TypeError(error_msg)
+
             self._web_log_message_queue.put(message)
             message_info = message.debug_info()
             logger.debug(f"Submitted Scheduling log for web: {message_info}")
@@ -447,7 +539,7 @@ class BaseScheduler(RabbitMQSchedulerModule, RedisSchedulerModule, SchedulerLogg
         messages = []
         while True:
             try:
-                item = self._web_log_message_queue.get_nowait()  # 线程安全的 get
+                item = self._web_log_message_queue.get_nowait()  # Thread-safe get
                 messages.append(item.to_dict())
             except queue.Empty:
                 break
@@ -461,25 +553,26 @@ class BaseScheduler(RabbitMQSchedulerModule, RedisSchedulerModule, SchedulerLogg
         """
         while self._running:  # Use a running flag for graceful shutdown
             try:
-                # Check if queue has messages (non-blocking)
-                if not self.memos_message_queue.empty():
-                    # Get all available messages at once
-                    messages = []
-                    while not self.memos_message_queue.empty():
-                        try:
-                            messages.append(self.memos_message_queue.get_nowait())
-                        except queue.Empty:
-                            break
+                # Get all available messages at once (thread-safe approach)
+                messages = []
+                while True:
+                    try:
+                        # Use get_nowait() directly without empty() check to avoid race conditions
+                        message = self.memos_message_queue.get_nowait()
+                        messages.append(message)
+                    except queue.Empty:
+                        # No more messages available
+                        break
 
-                    if messages:
-                        try:
-                            self.dispatcher.dispatch(messages)
-                        except Exception as e:
-                            logger.error(f"Error dispatching messages: {e!s}")
-                        finally:
-                            # Mark all messages as processed
-                            for _ in messages:
-                                self.memos_message_queue.task_done()
+                if messages:
+                    try:
+                        self.dispatcher.dispatch(messages)
+                    except Exception as e:
+                        logger.error(f"Error dispatching messages: {e!s}")
+                    finally:
+                        # Mark all messages as processed
+                        for _ in messages:
+                            self.memos_message_queue.task_done()
 
                 # Sleep briefly to prevent busy waiting
                 time.sleep(self._consume_interval)  # Adjust interval as needed
@@ -490,10 +583,10 @@ class BaseScheduler(RabbitMQSchedulerModule, RedisSchedulerModule, SchedulerLogg
 
     def start(self) -> None:
         """
-        Start the message consumer thread and initialize dispatcher resources.
+        Start the message consumer thread/process and initialize dispatcher resources.
 
         Initializes and starts:
-        1. Message consumer thread
+        1. Message consumer thread or process (based on startup_mode)
         2. Dispatcher thread pool (if parallel dispatch enabled)
         """
         if self._running:
@@ -506,20 +599,32 @@ class BaseScheduler(RabbitMQSchedulerModule, RedisSchedulerModule, SchedulerLogg
                 f"Initializing dispatcher thread pool with {self.thread_pool_max_workers} workers"
             )
 
-        # Start consumer thread
+        # Start consumer based on startup mode
         self._running = True
-        self._consumer_thread = threading.Thread(
-            target=self._message_consumer,
-            daemon=True,
-            name="MessageConsumerThread",
-        )
-        self._consumer_thread.start()
-        logger.info("Message consumer thread started")
+
+        if self.scheduler_startup_mode == STARTUP_BY_PROCESS:
+            # Start consumer process
+            self._consumer_process = multiprocessing.Process(
+                target=self._message_consumer,
+                daemon=True,
+                name="MessageConsumerProcess",
+            )
+            self._consumer_process.start()
+            logger.info("Message consumer process started")
+        else:
+            # Default to thread mode
+            self._consumer_thread = threading.Thread(
+                target=self._message_consumer,
+                daemon=True,
+                name="MessageConsumerThread",
+            )
+            self._consumer_thread.start()
+            logger.info("Message consumer thread started")
 
     def stop(self) -> None:
         """Stop all scheduler components gracefully.
 
-        1. Stops message consumer thread
+        1. Stops message consumer thread/process
         2. Shuts down dispatcher thread pool
         3. Cleans up resources
         """
@@ -527,11 +632,24 @@ class BaseScheduler(RabbitMQSchedulerModule, RedisSchedulerModule, SchedulerLogg
             logger.warning("Memory Scheduler is not running")
             return
 
-        # Signal consumer thread to stop
+        # Signal consumer thread/process to stop
         self._running = False
 
-        # Wait for consumer thread
-        if self._consumer_thread and self._consumer_thread.is_alive():
+        # Wait for consumer thread or process
+        if self.scheduler_startup_mode == STARTUP_BY_PROCESS and self._consumer_process:
+            if self._consumer_process.is_alive():
+                self._consumer_process.join(timeout=5.0)
+                if self._consumer_process.is_alive():
+                    logger.warning("Consumer process did not stop gracefully, terminating...")
+                    self._consumer_process.terminate()
+                    self._consumer_process.join(timeout=2.0)
+                    if self._consumer_process.is_alive():
+                        logger.error("Consumer process could not be terminated")
+                    else:
+                        logger.info("Consumer process terminated")
+                else:
+                    logger.info("Consumer process stopped")
+        elif self._consumer_thread and self._consumer_thread.is_alive():
             self._consumer_thread.join(timeout=5.0)
             if self._consumer_thread.is_alive():
                 logger.warning("Consumer thread did not stop gracefully")
@@ -551,6 +669,52 @@ class BaseScheduler(RabbitMQSchedulerModule, RedisSchedulerModule, SchedulerLogg
         # Clean up queues
         self._cleanup_queues()
         logger.info("Memory Scheduler stopped completely")
+
+    @property
+    def handlers(self) -> dict[str, Callable]:
+        """
+        Access the dispatcher's handlers dictionary.
+
+        Returns:
+            dict[str, Callable]: Dictionary mapping labels to handler functions
+        """
+        if not self.dispatcher:
+            logger.warning("Dispatcher is not initialized, returning empty handlers dict")
+            return {}
+
+        return self.dispatcher.handlers
+
+    def register_handlers(
+        self, handlers: dict[str, Callable[[list[ScheduleMessageItem]], None]]
+    ) -> None:
+        """
+        Bulk register multiple handlers from a dictionary.
+
+        Args:
+            handlers: Dictionary mapping labels to handler functions
+                      Format: {label: handler_callable}
+        """
+        if not self.dispatcher:
+            logger.warning("Dispatcher is not initialized, cannot register handlers")
+            return
+
+        self.dispatcher.register_handlers(handlers)
+
+    def unregister_handlers(self, labels: list[str]) -> dict[str, bool]:
+        """
+        Unregister handlers from the dispatcher by their labels.
+
+        Args:
+            labels: List of labels to unregister handlers for
+
+        Returns:
+            dict[str, bool]: Dictionary mapping each label to whether it was successfully unregistered
+        """
+        if not self.dispatcher:
+            logger.warning("Dispatcher is not initialized, cannot unregister handlers")
+            return dict.fromkeys(labels, False)
+
+        return self.dispatcher.unregister_handlers(labels)
 
     def _cleanup_queues(self) -> None:
         """Ensure all queues are emptied and marked as closed."""

@@ -7,6 +7,7 @@ from memos.configs.embedder import EmbedderConfigFactory
 from memos.configs.graph_db import GraphDBConfigFactory
 from memos.configs.internet_retriever import InternetRetrieverConfigFactory
 from memos.configs.llm import LLMConfigFactory
+from memos.configs.reranker import RerankerConfigFactory
 from memos.configs.vec_db import VectorDBConfigFactory
 from memos.exceptions import ConfigurationError
 
@@ -151,6 +152,10 @@ class TreeTextMemoryConfig(BaseTextMemoryConfig):
         default_factory=EmbedderConfigFactory,
         description="Embedder configuration for the memory embedding",
     )
+    reranker: RerankerConfigFactory | None = Field(
+        None,
+        description="Reranker configuration (optional, defaults to cosine_local).",
+    )
     graph_db: GraphDBConfigFactory = Field(
         ...,
         default_factory=GraphDBConfigFactory,
@@ -166,6 +171,18 @@ class TreeTextMemoryConfig(BaseTextMemoryConfig):
         description="Optional description for this memory configuration.",
     )
 
+    memory_size: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Maximum item counts per memory bucket, e.g.: "
+            '{"WorkingMemory": 20, "LongTermMemory": 10000, "UserMemory": 10000}'
+        ),
+    )
+
+
+class SimpleTreeTextMemoryConfig(TreeTextMemoryConfig):
+    """Simple tree text memory configuration class."""
+
 
 # ─── 3. Global Memory Config Factory ──────────────────────────────────────────
 
@@ -179,6 +196,7 @@ class MemoryConfigFactory(BaseConfig):
     backend_to_class: ClassVar[dict[str, Any]] = {
         "naive_text": NaiveTextMemoryConfig,
         "general_text": GeneralTextMemoryConfig,
+        "simple_tree_text": SimpleTreeTextMemoryConfig,
         "tree_text": TreeTextMemoryConfig,
         "kv_cache": KVCacheMemoryConfig,
         "vllm_kv_cache": KVCacheMemoryConfig,  # Use same config as kv_cache

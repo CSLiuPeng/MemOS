@@ -1,6 +1,6 @@
 user_id: "root"
 chat_model:
-  backend: "huggingface"
+  backend: "huggingface_singleton"
   config:
     model_name_or_path: "Qwen/Qwen3-1.7B"
     temperature: 0.1
@@ -32,7 +32,7 @@ mem_reader:
         chunk_overlap: 128
         min_sentences_per_chunk: 1
 mem_scheduler:
-  backend: "general_scheduler"
+  backend: "optimized_scheduler"
   config:
     top_k: 10
     act_mem_update_interval: 30

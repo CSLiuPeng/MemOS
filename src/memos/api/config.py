@@ -21,7 +21,7 @@ class APIConfig:
     def get_openai_config() -> dict[str, Any]:
         """Get OpenAI configuration."""
         return {
-            "model_name_or_path": os.getenv("MOS_OPENAI_MODEL", "gpt-4o-mini"),
+            "model_name_or_path": os.getenv("MOS_CHAT_MODEL", "gpt-4o-mini"),
             "temperature": float(os.getenv("MOS_CHAT_TEMPERATURE", "0.8")),
             "max_tokens": int(os.getenv("MOS_MAX_TOKENS", "1024")),
             "top_p": float(os.getenv("MOS_TOP_P", "0.9")),
@@ -77,6 +77,24 @@ class APIConfig:
         }
 
     @staticmethod
+    def get_memreader_config() -> dict[str, Any]:
+        """Get MemReader configuration."""
+        return {
+            "backend": "openai",
+            "config": {
+                "model_name_or_path": os.getenv("MEMRADER_MODEL", "gpt-4o-mini"),
+                "temperature": 0.6,
+                "max_tokens": int(os.getenv("MEMRADER_MAX_TOKENS", "5000")),
+                "top_p": 0.95,
+                "top_k": 20,
+                "api_key": os.getenv("MEMRADER_API_KEY", "EMPTY"),
+                "api_base": os.getenv("MEMRADER_API_BASE"),
+                "remove_think_prefix": True,
+                "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+            },
+        }
+
+    @staticmethod
     def get_activation_vllm_config() -> dict[str, Any]:
         """Get Ollama configuration."""
         return {
@@ -89,6 +107,31 @@ class APIConfig:
                 },
             },
         }
+
+    @staticmethod
+    def get_reranker_config() -> dict[str, Any]:
+        """Get embedder configuration."""
+        embedder_backend = os.getenv("MOS_RERANKER_BACKEND", "http_bge")
+
+        if embedder_backend == "http_bge":
+            return {
+                "backend": "http_bge",
+                "config": {
+                    "url": os.getenv("MOS_RERANKER_URL"),
+                    "model": os.getenv("MOS_RERANKER_MODEL", "bge-reranker-v2-m3"),
+                    "timeout": 10,
+                    "headers_extra": os.getenv("MOS_RERANKER_HEADERS_EXTRA"),
+                    "rerank_source": os.getenv("MOS_RERANK_SOURCE"),
+                },
+            }
+        else:
+            return {
+                "backend": "cosine_local",
+                "config": {
+                    "level_weights": {"topic": 1.0, "concept": 1.0, "fact": 1.0},
+                    "level_field": "background",
+                },
+            }
 
     @staticmethod
     def get_embedder_config() -> dict[str, Any]:
@@ -163,22 +206,22 @@ class APIConfig:
         return {
             "uri": os.getenv("NEO4J_URI", "bolt://localhost:7687"),
             "user": os.getenv("NEO4J_USER", "neo4j"),
-            "db_name": os.getenv("NEO4J_DB_NAME", "shared-tree-textual-memory"),
+            "db_name": os.getenv("NEO4J_DB_NAME", "neo4j"),
             "password": os.getenv("NEO4J_PASSWORD", "12345678"),
             "user_name": f"memos{user_id.replace('-', '')}",
-            "auto_create": True,
+            "auto_create": False,
             "use_multi_db": False,
-            "embedding_dimension": int(os.getenv("EMBEDDING_DIMENSION", 3072)),
+            "embedding_dimension": int(os.getenv("EMBEDDING_DIMENSION", 1024)),
             "vec_config": {
                 # Pass nested config to initialize external vector DB
                 # If you use qdrant, please use Server instead of local mode.
                 "backend": "qdrant",
                 "config": {
                     "collection_name": "neo4j_vec_db",
-                    "vector_dimension": int(os.getenv("EMBEDDING_DIMENSION", 3072)),
+                    "vector_dimension": int(os.getenv("EMBEDDING_DIMENSION", 1024)),
                     "distance_metric": "cosine",
-                    "host": "localhost",
-                    "port": 6333,
+                    "host": os.getenv("QDRANT_HOST", "localhost"),
+                    "port": int(os.getenv("QDRANT_PORT", "6333")),
                 },
             },
         }
@@ -248,7 +291,7 @@ class APIConfig:
     def get_scheduler_config() -> dict[str, Any]:
         """Get scheduler configuration."""
         return {
-            "backend": "general_scheduler",
+            "backend": "optimized_scheduler",
             "config": {
                 "top_k": int(os.getenv("MOS_SCHEDULER_TOP_K", "10")),
                 "act_mem_update_interval": int(
@@ -326,10 +369,7 @@ class APIConfig:
             "mem_reader": {
                 "backend": "simple_struct",
                 "config": {
-                    "llm": {
-                        "backend": "openai",
-                        "config": openai_config,
-                    },
+                    "llm": APIConfig.get_memreader_config(),
                     "embedder": APIConfig.get_embedder_config(),
                     "chunker": {
                         "backend": "sentence",
@@ -422,10 +462,7 @@ class APIConfig:
             "mem_reader": {
                 "backend": "simple_struct",
                 "config": {
-                    "llm": {
-                        "backend": "openai",
-                        "config": openai_config,
-                    },
+                    "llm": APIConfig.get_memreader_config(),
                     "embedder": APIConfig.get_embedder_config(),
                     "chunker": {
                         "backend": "sentence",
@@ -492,6 +529,14 @@ class APIConfig:
                             },
                             "embedder": APIConfig.get_embedder_config(),
                             "internet_retriever": internet_config,
+                            "reranker": APIConfig.get_reranker_config(),
+                            "reorganize": os.getenv("MOS_ENABLE_REORGANIZE", "false").lower()
+                            == "true",
+                            "memory_size": {
+                                "WorkingMemory": os.getenv("NEBULAR_WORKING_MEMORY", 20),
+                                "LongTermMemory": os.getenv("NEBULAR_LONGTERM_MEMORY", 1e6),
+                                "UserMemory": os.getenv("NEBULAR_USER_MEMORY", 1e6),
+                            },
                         },
                     },
                     "act_mem": {}
@@ -545,9 +590,15 @@ class APIConfig:
                                 "config": graph_db_backend_map[graph_db_backend],
                             },
                             "embedder": APIConfig.get_embedder_config(),
+                            "reranker": APIConfig.get_reranker_config(),
                             "reorganize": os.getenv("MOS_ENABLE_REORGANIZE", "false").lower()
                             == "true",
                             "internet_retriever": internet_config,
+                            "memory_size": {
+                                "WorkingMemory": os.getenv("NEBULAR_WORKING_MEMORY", 20),
+                                "LongTermMemory": os.getenv("NEBULAR_LONGTERM_MEMORY", 1e6),
+                                "UserMemory": os.getenv("NEBULAR_USER_MEMORY", 1e6),
+                            },
                         },
                     },
                     "act_mem": {}

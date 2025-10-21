@@ -1,9 +1,14 @@
 import concurrent.futures
 
+from memos.context.context import ContextThreadPoolExecutor
 from memos.embedders.factory import OllamaEmbedder
 from memos.graph_dbs.neo4j import Neo4jGraphDB
+from memos.log import get_logger
 from memos.memories.textual.item import TextualMemoryItem
 from memos.memories.textual.tree_text_memory.retrieve.retrieval_mid_structs import ParsedTaskGoal
+
+
+logger = get_logger(__name__)
 
 
 class GraphMemoryRetriever:
@@ -14,6 +19,8 @@ class GraphMemoryRetriever:
     def __init__(self, graph_store: Neo4jGraphDB, embedder: OllamaEmbedder):
         self.graph_store = graph_store
         self.embedder = embedder
+        self.max_workers = 10
+        self.filter_weight = 0.6
 
     def retrieve(
         self,
@@ -22,6 +29,8 @@ class GraphMemoryRetriever:
         top_k: int,
         memory_scope: str,
         query_embedding: list[list[float]] | None = None,
+        search_filter: dict | None = None,
+        user_name: str | None = None,
     ) -> list[TextualMemoryItem]:
         """
         Perform hybrid memory retrieval:
@@ -35,7 +44,7 @@ class GraphMemoryRetriever:
             top_k (int): Number of candidates to return.
             memory_scope (str): One of ['working', 'long_term', 'user'].
             query_embedding(list of embedding): list of embedding of query
-
+            search_filter (dict, optional): Optional metadata filters for search results.
         Returns:
             list: Combined memory items.
         """
@@ -45,16 +54,21 @@ class GraphMemoryRetriever:
         if memory_scope == "WorkingMemory":
             # For working memory, retrieve all entries (no filtering)
             working_memories = self.graph_store.get_all_memory_items(
-                scope="WorkingMemory", include_embedding=True
+                scope="WorkingMemory", include_embedding=False, user_name=user_name
             )
             return [TextualMemoryItem.from_dict(record) for record in working_memories]
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        with ContextThreadPoolExecutor(max_workers=2) as executor:
             # Structured graph-based retrieval
-            future_graph = executor.submit(self._graph_recall, parsed_goal, memory_scope)
+            future_graph = executor.submit(self._graph_recall, parsed_goal, memory_scope, user_name)
             # Vector similarity search
             future_vector = executor.submit(
-                self._vector_recall, query_embedding, memory_scope, top_k
+                self._vector_recall,
+                query_embedding or [],
+                memory_scope,
+                top_k,
+                search_filter=search_filter,
+                user_name=user_name,
             )
 
             graph_results = future_graph.result()
@@ -74,8 +88,54 @@ class GraphMemoryRetriever:
 
         return list(combined.values())
 
+    def retrieve_from_cube(
+        self,
+        top_k: int,
+        memory_scope: str,
+        query_embedding: list[list[float]] | None = None,
+        cube_name: str = "memos_cube01",
+        user_name: str | None = None,
+    ) -> list[TextualMemoryItem]:
+        """
+        Perform hybrid memory retrieval:
+        - Run graph-based lookup from dispatch plan.
+        - Run vector similarity search from embedded query.
+        - Merge and return combined result set.
+
+        Args:
+            top_k (int): Number of candidates to return.
+            memory_scope (str): One of ['working', 'long_term', 'user'].
+            query_embedding(list of embedding): list of embedding of query
+            cube_name: specify cube_name
+
+        Returns:
+            list: Combined memory items.
+        """
+        if memory_scope not in ["WorkingMemory", "LongTermMemory", "UserMemory"]:
+            raise ValueError(f"Unsupported memory scope: {memory_scope}")
+
+        graph_results = self._vector_recall(
+            query_embedding, memory_scope, top_k, cube_name=cube_name, user_name=user_name
+        )
+
+        for result_i in graph_results:
+            result_i.metadata.memory_type = "OuterMemory"
+        # Merge and deduplicate by ID
+        combined = {item.id: item for item in graph_results}
+
+        graph_ids = {item.id for item in graph_results}
+        combined_ids = set(combined.keys())
+        lost_ids = graph_ids - combined_ids
+
+        if lost_ids:
+            print(
+                f"[DEBUG] The following nodes were in graph_results but missing in combined: {lost_ids}"
+            )
+
+        return list(combined.values())
+
     def _graph_recall(
-        self, parsed_goal: ParsedTaskGoal, memory_scope: str
+        self, parsed_goal: ParsedTaskGoal, memory_scope: str, user_name: str | None = None
     ) -> list[TextualMemoryItem]:
         """
         Perform structured node-based retrieval from Neo4j.
@@ -91,7 +151,7 @@ class GraphMemoryRetriever:
                 {"field": "key", "op": "in", "value": parsed_goal.keys},
                 {"field": "memory_type", "op": "=", "value": memory_scope},
             ]
-            key_ids = self.graph_store.get_by_metadata(key_filters)
+            key_ids = self.graph_store.get_by_metadata(key_filters, user_name=user_name)
             candidate_ids.update(key_ids)
 
         # 2) tag-based OR branch
@@ -100,7 +160,7 @@ class GraphMemoryRetriever:
                 {"field": "tags", "op": "contains", "value": parsed_goal.tags},
                 {"field": "memory_type", "op": "=", "value": memory_scope},
             ]
-            tag_ids = self.graph_store.get_by_metadata(tag_filters)
+            tag_ids = self.graph_store.get_by_metadata(tag_filters, user_name=user_name)
             candidate_ids.update(tag_ids)
 
         # No matches → return empty
@@ -108,7 +168,9 @@ class GraphMemoryRetriever:
             return []
 
         # Load nodes and post-filter
-        node_dicts = self.graph_store.get_nodes(list(candidate_ids), include_embedding=True)
+        node_dicts = self.graph_store.get_nodes(
+            list(candidate_ids), include_embedding=False, user_name=user_name
+        )
 
         final_nodes = []
         for node in node_dicts:
@@ -134,31 +196,74 @@ class GraphMemoryRetriever:
         query_embedding: list[list[float]],
         memory_scope: str,
         top_k: int = 20,
-        max_num: int = 5,
+        max_num: int = 3,
+        cube_name: str | None = None,
+        search_filter: dict | None = None,
+        user_name: str | None = None,
     ) -> list[TextualMemoryItem]:
         """
-        # TODO: tackle with post-filter and pre-filter(5.18+) better.
         Perform vector-based similarity retrieval using query embedding.
+        # TODO: tackle with post-filter and pre-filter(5.18+) better.
         """
-        all_matches = []
+        if not query_embedding:
+            return []
 
-        def search_single(vec):
+        def search_single(vec, filt=None):
             return (
-                self.graph_store.search_by_embedding(vector=vec, top_k=top_k, scope=memory_scope)
+                self.graph_store.search_by_embedding(
+                    vector=vec,
+                    top_k=top_k,
+                    scope=memory_scope,
+                    cube_name=cube_name,
+                    search_filter=filt,
+                    user_name=user_name,
+                )
                 or []
             )
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = [executor.submit(search_single, vec) for vec in query_embedding[:max_num]]
-            for future in concurrent.futures.as_completed(futures):
-                result = future.result()
-                all_matches.extend(result)
+        def search_path_a():
+            """Path A: search without filter"""
+            path_a_hits = []
+            with ContextThreadPoolExecutor() as executor:
+                futures = [
+                    executor.submit(search_single, vec, None) for vec in query_embedding[:max_num]
+                ]
+                for f in concurrent.futures.as_completed(futures):
+                    path_a_hits.extend(f.result() or [])
+            return path_a_hits
 
-        if not all_matches:
+        def search_path_b():
+            """Path B: search with filter"""
+            if not search_filter:
+                return []
+            path_b_hits = []
+            with ContextThreadPoolExecutor() as executor:
+                futures = [
+                    executor.submit(search_single, vec, search_filter)
+                    for vec in query_embedding[:max_num]
+                ]
+                for f in concurrent.futures.as_completed(futures):
+                    path_b_hits.extend(f.result() or [])
+            return path_b_hits
+
+        # Execute both paths concurrently
+        all_hits = []
+        with ContextThreadPoolExecutor(max_workers=2) as executor:
+            path_a_future = executor.submit(search_path_a)
+            path_b_future = executor.submit(search_path_b)
+
+            all_hits.extend(path_a_future.result())
+            all_hits.extend(path_b_future.result())
+
+        if not all_hits:
             return []
 
-        # Step 3: Extract matched IDs and retrieve full nodes
-        unique_ids = set({r["id"] for r in all_matches})
-        node_dicts = self.graph_store.get_nodes(list(unique_ids), include_embedding=True)
-
-        return [TextualMemoryItem.from_dict(record) for record in node_dicts]
+        # merge and deduplicate
+        unique_ids = {r["id"] for r in all_hits if r.get("id")}
+        node_dicts = (
+            self.graph_store.get_nodes(
+                list(unique_ids), include_embedding=False, cube_name=cube_name, user_name=user_name
+            )
+            or []
+        )
+        return [TextualMemoryItem.from_dict(n) for n in node_dicts]

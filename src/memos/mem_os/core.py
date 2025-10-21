@@ -24,7 +24,7 @@ from memos.mem_user.user_manager import UserManager, UserRole
 from memos.memories.activation.item import ActivationMemoryItem
 from memos.memories.parametric.item import ParametricMemoryItem
 from memos.memories.textual.item import TextualMemoryItem, TextualMemoryMetadata
-from memos.memos_tools.thread_safe_dict import ThreadSafeDict
+from memos.memos_tools.thread_safe_dict_segment import OptimizedThreadSafeDict
 from memos.templates.mos_prompts import QUERY_REWRITING_PROMPT
 from memos.types import ChatHistory, MessageList, MOSSearchResult
 
@@ -47,8 +47,8 @@ class MOSCore:
         self.mem_reader = MemReaderFactory.from_config(config.mem_reader)
         self.chat_history_manager: dict[str, ChatHistory] = {}
         # use thread safe dict for multi-user product-server scenario
-        self.mem_cubes: ThreadSafeDict[str, GeneralMemCube] = (
-            ThreadSafeDict() if user_manager is not None else {}
+        self.mem_cubes: OptimizedThreadSafeDict[str, GeneralMemCube] = (
+            OptimizedThreadSafeDict() if user_manager is not None else {}
         )
         self._register_chat_history()
 
@@ -124,13 +124,12 @@ class MOSCore:
                     f"Memory reader of type {type(self.mem_reader).__name__} "
                     "missing required 'llm' attribute"
                 )
-                self._mem_scheduler.initialize_modules(
-                    chat_llm=self.chat_llm, process_llm=self.chat_llm
-                )
             else:
                 # Configure scheduler general_modules
                 self._mem_scheduler.initialize_modules(
-                    chat_llm=self.chat_llm, process_llm=self.mem_reader.llm
+                    chat_llm=self.chat_llm,
+                    process_llm=self.mem_reader.llm,
+                    db_engine=self.user_manager.engine,
                 )
             self._mem_scheduler.start()
             return self._mem_scheduler
@@ -182,13 +181,13 @@ class MOSCore:
                 logger.info(f"close reorganizer for {mem_cube.text_mem.config.cube_id}")
                 mem_cube.text_mem.memory_manager.wait_reorganizer()
 
-    def _register_chat_history(self, user_id: str | None = None) -> None:
+    def _register_chat_history(
+        self, user_id: str | None = None, session_id: str | None = None
+    ) -> None:
         """Initialize chat history with user ID."""
-        if user_id is None:
-            user_id = self.user_id
         self.chat_history_manager[user_id] = ChatHistory(
-            user_id=user_id,
-            session_id=self.session_id,
+            user_id=user_id if user_id is not None else self.user_id,
+            session_id=session_id if session_id is not None else self.session_id,
             created_at=datetime.utcnow(),
             total_messages=0,
             chat_history=[],
@@ -352,6 +351,7 @@ class MOSCore:
         self,
         memories: list[TextualMemoryItem] | list[str] | None = None,
         base_prompt: str | None = None,
+        **kwargs,
     ) -> str:
         """Build system prompt with optional memories context."""
         if base_prompt is None:
@@ -482,14 +482,14 @@ class MOSCore:
                 self.mem_cubes[mem_cube_id] = mem_cube_name_or_path
                 logger.info(f"register new cube {mem_cube_id} for user {target_user_id}")
             elif os.path.exists(mem_cube_name_or_path):
-                self.mem_cubes[mem_cube_id] = GeneralMemCube.init_from_dir(mem_cube_name_or_path)
+                mem_cube_obj = GeneralMemCube.init_from_dir(mem_cube_name_or_path)
+                self.mem_cubes[mem_cube_id] = mem_cube_obj
             else:
                 logger.warning(
                     f"MemCube {mem_cube_name_or_path} does not exist, try to init from remote repo."
                 )
-                self.mem_cubes[mem_cube_id] = GeneralMemCube.init_from_remote_repo(
-                    mem_cube_name_or_path
-                )
+                mem_cube_obj = GeneralMemCube.init_from_remote_repo(mem_cube_name_or_path)
+                self.mem_cubes[mem_cube_id] = mem_cube_obj
         # Check if cube already exists in database
         existing_cube = self.user_manager.get_cube(mem_cube_id)
 
@@ -545,6 +545,9 @@ class MOSCore:
         top_k: int | None = None,
         mode: Literal["fast", "fine"] = "fast",
         internet_search: bool = False,
+        moscube: bool = False,
+        session_id: str | None = None,
+        **kwargs,
     ) -> MOSSearchResult:
         """
         Search for textual memories across all registered MemCubes.
@@ -559,7 +562,9 @@ class MOSCore:
         Returns:
             MemoryResult: A dictionary containing the search results.
         """
+        target_session_id = session_id if session_id is not None else self.session_id
         target_user_id = user_id if user_id is not None else self.user_id
+
         self._validate_user_exists(target_user_id)
         # Get all cubes accessible by the target user
         accessible_cubes = self.user_manager.get_user_cubes(target_user_id)
@@ -572,6 +577,11 @@ class MOSCore:
             self._register_chat_history(target_user_id)
         chat_history = self.chat_history_manager[target_user_id]
 
+        # Create search filter if session_id is provided
+        search_filter = None
+        if session_id is not None:
+            search_filter = {"session_id": session_id}
+
         result: MOSSearchResult = {
             "text_mem": [],
             "act_mem": [],
@@ -581,9 +591,13 @@ class MOSCore:
             install_cube_ids = user_cube_ids
         # create exist dict in mem_cubes and avoid  one search slow
         tmp_mem_cubes = {}
+        time_start_cube_get = time.time()
         for mem_cube_id in install_cube_ids:
             if mem_cube_id in self.mem_cubes:
                 tmp_mem_cubes[mem_cube_id] = self.mem_cubes.get(mem_cube_id)
+        logger.info(
+            f"time search: transform cube time user_id: {target_user_id} time is: {time.time() - time_start_cube_get}"
+        )
 
         for mem_cube_id, mem_cube in tmp_mem_cubes.items():
             if (
@@ -599,9 +613,11 @@ class MOSCore:
                     manual_close_internet=not internet_search,
                     info={
                         "user_id": target_user_id,
-                        "session_id": self.session_id,
+                        "session_id": target_session_id,
                         "chat_history": chat_history.chat_history,
                     },
+                    moscube=moscube,
+                    search_filter=search_filter,
                 )
                 result["text_mem"].append({"cube_id": mem_cube_id, "memories": memories})
                 logger.info(
@@ -620,6 +636,8 @@ class MOSCore:
         doc_path: str | None = None,
         mem_cube_id: str | None = None,
         user_id: str | None = None,
+        session_id: str | None = None,
+        **kwargs,
     ) -> None:
         """
         Add textual memories to a MemCube.
@@ -632,11 +650,16 @@ class MOSCore:
                 If None, the default MemCube for the user is used.
             user_id (str, optional): The identifier of the user to add the memories to.
                 If None, the default user is used.
+            session_id (str, optional): session_id
         """
         # user input messages
         assert (messages is not None) or (memory_content is not None) or (doc_path is not None), (
             "messages_or_doc_path or memory_content or doc_path must be provided."
         )
+        # TODO: asure that session_id is a valid string
+        time_start = time.time()
+
+        target_session_id = session_id if session_id else self.session_id
         target_user_id = user_id if user_id is not None else self.user_id
         if mem_cube_id is None:
             # Try to find a default cube for the user
@@ -648,18 +671,29 @@ class MOSCore:
             mem_cube_id = accessible_cubes[0].cube_id  # TODO not only first
         else:
             self._validate_cube_access(target_user_id, mem_cube_id)
+        logger.info(
+            f"time add: get mem_cube_id time user_id: {target_user_id} time is: {time.time() - time_start}"
+        )
 
+        time_start_0 = time.time()
         if mem_cube_id not in self.mem_cubes:
             raise ValueError(f"MemCube '{mem_cube_id}' is not loaded. Please register.")
+        logger.info(
+            f"time add: get mem_cube_id check in mem_cubes time user_id: {target_user_id} time is: {time.time() - time_start_0}"
+        )
+        time_start_1 = time.time()
         if (
             (messages is not None)
             and self.config.enable_textual_memory
             and self.mem_cubes[mem_cube_id].text_mem
         ):
+            logger.info(
+                f"time add: messages is not None and enable_textual_memory and text_mem is not None time user_id: {target_user_id} time is: {time.time() - time_start_1}"
+            )
             if self.mem_cubes[mem_cube_id].config.text_mem.backend != "tree_text":
                 add_memory = []
                 metadata = TextualMemoryMetadata(
-                    user_id=self.user_id, session_id=self.session_id, source="conversation"
+                    user_id=target_user_id, session_id=target_session_id, source="conversation"
                 )
                 for message in messages:
                     add_memory.append(
@@ -668,12 +702,15 @@ class MOSCore:
                 self.mem_cubes[mem_cube_id].text_mem.add(add_memory)
             else:
                 messages_list = [messages]
+                time_start_2 = time.time()
                 memories = self.mem_reader.get_memory(
                     messages_list,
                     type="chat",
-                    info={"user_id": target_user_id, "session_id": self.session_id},
+                    info={"user_id": target_user_id, "session_id": target_session_id},
                 )
-
+                logger.info(
+                    f"time add: get mem_reader time user_id: {target_user_id} time is: {time.time() - time_start_2}"
+                )
                 mem_ids = []
                 for mem in memories:
                     mem_id_list: list[str] = self.mem_cubes[mem_cube_id].text_mem.add(mem)
@@ -703,7 +740,7 @@ class MOSCore:
         ):
             if self.mem_cubes[mem_cube_id].config.text_mem.backend != "tree_text":
                 metadata = TextualMemoryMetadata(
-                    user_id=self.user_id, session_id=self.session_id, source="conversation"
+                    user_id=target_user_id, session_id=target_session_id, source="conversation"
                 )
                 self.mem_cubes[mem_cube_id].text_mem.add(
                     [TextualMemoryItem(memory=memory_content, metadata=metadata)]
@@ -715,7 +752,7 @@ class MOSCore:
                 memories = self.mem_reader.get_memory(
                     messages_list,
                     type="chat",
-                    info={"user_id": target_user_id, "session_id": self.session_id},
+                    info={"user_id": target_user_id, "session_id": target_session_id},
                 )
 
                 mem_ids = []
@@ -749,7 +786,7 @@ class MOSCore:
             doc_memories = self.mem_reader.get_memory(
                 documents,
                 type="doc",
-                info={"user_id": target_user_id, "session_id": self.session_id},
+                info={"user_id": target_user_id, "session_id": target_session_id},
             )
 
             mem_ids = []
@@ -956,9 +993,33 @@ class MOSCore:
         self.mem_cubes[mem_cube_id].dump(dump_dir)
         logger.info(f"MemCube {mem_cube_id} dumped to {dump_dir}")
 
+    def load(
+        self,
+        load_dir: str,
+        user_id: str | None = None,
+        mem_cube_id: str | None = None,
+        memory_types: list[Literal["text_mem", "act_mem", "para_mem"]] | None = None,
+    ) -> None:
+        """Dump the MemCube to a dictionary.
+        Args:
+            load_dir (str): The directory to load the MemCube from.
+            user_id (str, optional): The identifier of the user to load the MemCube from.
+                If None, the default user is used.
+            mem_cube_id (str, optional): The identifier of the MemCube to load.
+                If None, the default MemCube for the user is used.
+        """
+        target_user_id = user_id if user_id is not None else self.user_id
+        accessible_cubes = self.user_manager.get_user_cubes(target_user_id)
+        if not mem_cube_id:
+            mem_cube_id = accessible_cubes[0].cube_id
+        if mem_cube_id not in self.mem_cubes:
+            raise ValueError(f"MemCube with ID {mem_cube_id} does not exist. please regiester")
+        self.mem_cubes[mem_cube_id].load(load_dir, memory_types=memory_types)
+        logger.info(f"MemCube {mem_cube_id} loaded from {load_dir}")
+
     def get_user_info(self) -> dict[str, Any]:
         """Get current user information including accessible cubes.
-
+        TODO: maybe input user_id
         Returns:
             dict: User information and accessible cubes.
         """
@@ -971,7 +1032,7 @@ class MOSCore:
         return {
             "user_id": user.user_id,
             "user_name": user.user_name,
-            "role": user.role.value,
+            "role": user.role.value if hasattr(user.role, "value") else user.role,
             "created_at": user.created_at.isoformat(),
             "accessible_cubes": [
                 {

@@ -1,19 +1,19 @@
-import concurrent.futures
 import json
+import traceback
 
 from datetime import datetime
 
+from memos.context.context import ContextThreadPoolExecutor
 from memos.embedders.factory import OllamaEmbedder
 from memos.graph_dbs.factory import Neo4jGraphDB
 from memos.llms.factory import AzureLLM, OllamaLLM, OpenAILLM
 from memos.log import get_logger
 from memos.memories.textual.item import SearchedTreeNodeTextualMemoryMetadata, TextualMemoryItem
+from memos.reranker.base import BaseReranker
 from memos.utils import timed
 
-from .internet_retriever_factory import InternetRetrieverFactory
 from .reasoner import MemoryReasoner
 from .recall import GraphMemoryRetriever
-from .reranker import MemoryReranker
 from .task_goal_parser import TaskGoalParser
 
 
@@ -26,22 +26,34 @@ class Searcher:
         dispatcher_llm: OpenAILLM | OllamaLLM | AzureLLM,
         graph_store: Neo4jGraphDB,
         embedder: OllamaEmbedder,
-        internet_retriever: InternetRetrieverFactory | None = None,
+        reranker: BaseReranker,
+        internet_retriever: None = None,
+        moscube: bool = False,
     ):
         self.graph_store = graph_store
         self.embedder = embedder
 
         self.task_goal_parser = TaskGoalParser(dispatcher_llm)
         self.graph_retriever = GraphMemoryRetriever(self.graph_store, self.embedder)
-        self.reranker = MemoryReranker(dispatcher_llm, self.embedder)
+        self.reranker = reranker
         self.reasoner = MemoryReasoner(dispatcher_llm)
 
         # Create internet retriever from config if provided
         self.internet_retriever = internet_retriever
+        self.moscube = moscube
+
+        self._usage_executor = ContextThreadPoolExecutor(max_workers=4, thread_name_prefix="usage")
 
     @timed
     def search(
-        self, query: str, top_k: int, info=None, mode="fast", memory_type="All"
+        self,
+        query: str,
+        top_k: int,
+        info=None,
+        mode="fast",
+        memory_type="All",
+        search_filter: dict | None = None,
+        user_name: str | None = None,
     ) -> list[TextualMemoryItem]:
         """
         Search for memories based on a query.
@@ -56,6 +68,7 @@ class Searcher:
             - 'fine': Uses a more detailed search process, invoking large models for higher precision, but slower performance.
             memory_type (str): Type restriction for search.
             ['All', 'WorkingMemory', 'LongTermMemory', 'UserMemory']
+            search_filter (dict, optional): Optional metadata filters for search results.
         Returns:
             list[TextualMemoryItem]: List of matching memories.
         """
@@ -71,19 +84,43 @@ class Searcher:
         else:
             logger.debug(f"[SEARCH] Received info dict: {info}")
 
-        parsed_goal, query_embedding, context, query = self._parse_task(query, info, mode)
+        parsed_goal, query_embedding, context, query = self._parse_task(
+            query, info, mode, search_filter=search_filter, user_name=user_name
+        )
         results = self._retrieve_paths(
-            query, parsed_goal, query_embedding, info, top_k, mode, memory_type
+            query,
+            parsed_goal,
+            query_embedding,
+            info,
+            top_k,
+            mode,
+            memory_type,
+            search_filter,
+            user_name,
         )
         deduped = self._deduplicate_results(results)
         final_results = self._sort_and_trim(deduped, top_k)
-        self._update_usage_history(final_results, info)
+        self._update_usage_history(final_results, info, user_name)
 
         logger.info(f"[SEARCH] Done. Total {len(final_results)} results.")
+        res_results = ""
+        for _num_i, result in enumerate(final_results):
+            res_results += "\n" + (
+                result.id + "|" + result.metadata.memory_type + "|" + result.memory
+            )
+        logger.info(f"[SEARCH] Results. {res_results}")
         return final_results
 
     @timed
-    def _parse_task(self, query, info, mode, top_k=5):
+    def _parse_task(
+        self,
+        query,
+        info,
+        mode,
+        top_k=5,
+        search_filter: dict | None = None,
+        user_name: str | None = None,
+    ):
         """Parse user query, do embedding search and create context"""
         context = []
         query_embedding = None
@@ -96,14 +133,30 @@ class Searcher:
             # retrieve related nodes by embedding
             related_nodes = [
                 self.graph_store.get_node(n["id"])
-                for n in self.graph_store.search_by_embedding(query_embedding, top_k=top_k)
+                for n in self.graph_store.search_by_embedding(
+                    query_embedding, top_k=top_k, search_filter=search_filter, user_name=user_name
+                )
             ]
-            context = list({node["memory"] for node in related_nodes})
+            memories = []
+            for node in related_nodes:
+                try:
+                    m = (
+                        node.get("memory")
+                        if isinstance(node, dict)
+                        else (getattr(node, "memory", None))
+                    )
+                    if isinstance(m, str) and m:
+                        memories.append(m)
+                except Exception:
+                    logger.error(f"[SEARCH] Error during search: {traceback.format_exc()}")
+                    continue
+            context = list(dict.fromkeys(memories))
 
             # optional: supplement context with internet knowledge
-            if self.internet_retriever:
+            """if self.internet_retriever:
                 extra = self.internet_retriever.retrieve_from_internet(query=query, top_k=3)
                 context.extend(item.memory.partition("\nContent: ")[-1] for item in extra)
+            """
 
         # parse goal using LLM
         parsed_goal = self.task_goal_parser.parse(
@@ -121,10 +174,21 @@ class Searcher:
         return parsed_goal, query_embedding, context, query
 
     @timed
-    def _retrieve_paths(self, query, parsed_goal, query_embedding, info, top_k, mode, memory_type):
+    def _retrieve_paths(
+        self,
+        query,
+        parsed_goal,
+        query_embedding,
+        info,
+        top_k,
+        mode,
+        memory_type,
+        search_filter: dict | None = None,
+        user_name: str | None = None,
+    ):
         """Run A/B/C retrieval paths in parallel"""
         tasks = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        with ContextThreadPoolExecutor(max_workers=3) as executor:
             tasks.append(
                 executor.submit(
                     self._retrieve_from_working_memory,
@@ -133,6 +197,8 @@ class Searcher:
                     query_embedding,
                     top_k,
                     memory_type,
+                    search_filter,
+                    user_name,
                 )
             )
             tasks.append(
@@ -143,6 +209,8 @@ class Searcher:
                     query_embedding,
                     top_k,
                     memory_type,
+                    search_filter,
+                    user_name,
                 )
             )
             tasks.append(
@@ -155,8 +223,20 @@ class Searcher:
                     info,
                     mode,
                     memory_type,
+                    user_name,
                 )
             )
+            if self.moscube:
+                tasks.append(
+                    executor.submit(
+                        self._retrieve_from_memcubes,
+                        query,
+                        parsed_goal,
+                        query_embedding,
+                        top_k,
+                        "memos_cube01",
+                    )
+                )
 
             results = []
             for t in tasks:
@@ -168,14 +248,26 @@ class Searcher:
     # --- Path A
     @timed
     def _retrieve_from_working_memory(
-        self, query, parsed_goal, query_embedding, top_k, memory_type
+        self,
+        query,
+        parsed_goal,
+        query_embedding,
+        top_k,
+        memory_type,
+        search_filter: dict | None = None,
+        user_name: str | None = None,
     ):
         """Retrieve and rerank from WorkingMemory"""
         if memory_type not in ["All", "WorkingMemory"]:
             logger.info(f"[PATH-A] '{query}'Skipped (memory_type does not match)")
             return []
         items = self.graph_retriever.retrieve(
-            query=query, parsed_goal=parsed_goal, top_k=top_k, memory_scope="WorkingMemory"
+            query=query,
+            parsed_goal=parsed_goal,
+            top_k=top_k,
+            memory_scope="WorkingMemory",
+            search_filter=search_filter,
+            user_name=user_name,
         )
         return self.reranker.rerank(
             query=query,
@@ -183,43 +275,98 @@ class Searcher:
             graph_results=items,
             top_k=top_k,
             parsed_goal=parsed_goal,
+            search_filter=search_filter,
         )
 
     # --- Path B
     @timed
     def _retrieve_from_long_term_and_user(
-        self, query, parsed_goal, query_embedding, top_k, memory_type
+        self,
+        query,
+        parsed_goal,
+        query_embedding,
+        top_k,
+        memory_type,
+        search_filter: dict | None = None,
+        user_name: str | None = None,
     ):
         """Retrieve and rerank from LongTermMemory and UserMemory"""
         results = []
-        if memory_type in ["All", "LongTermMemory"]:
-            results += self.graph_retriever.retrieve(
-                query=query,
-                parsed_goal=parsed_goal,
-                query_embedding=query_embedding,
-                top_k=top_k * 2,
-                memory_scope="LongTermMemory",
-            )
-        if memory_type in ["All", "UserMemory"]:
-            results += self.graph_retriever.retrieve(
-                query=query,
-                parsed_goal=parsed_goal,
-                query_embedding=query_embedding,
-                top_k=top_k * 2,
-                memory_scope="UserMemory",
-            )
+        tasks = []
+
+        with ContextThreadPoolExecutor(max_workers=2) as executor:
+            if memory_type in ["All", "LongTermMemory"]:
+                tasks.append(
+                    executor.submit(
+                        self.graph_retriever.retrieve,
+                        query=query,
+                        parsed_goal=parsed_goal,
+                        query_embedding=query_embedding,
+                        top_k=top_k * 2,
+                        memory_scope="LongTermMemory",
+                        search_filter=search_filter,
+                        user_name=user_name,
+                    )
+                )
+            if memory_type in ["All", "UserMemory"]:
+                tasks.append(
+                    executor.submit(
+                        self.graph_retriever.retrieve,
+                        query=query,
+                        parsed_goal=parsed_goal,
+                        query_embedding=query_embedding,
+                        top_k=top_k * 2,
+                        memory_scope="UserMemory",
+                        search_filter=search_filter,
+                        user_name=user_name,
+                    )
+                )
+
+            # Collect results from all tasks
+            for task in tasks:
+                results.extend(task.result())
+
         return self.reranker.rerank(
             query=query,
             query_embedding=query_embedding[0],
             graph_results=results,
+            top_k=top_k,
+            parsed_goal=parsed_goal,
+            search_filter=search_filter,
+        )
+
+    @timed
+    def _retrieve_from_memcubes(
+        self, query, parsed_goal, query_embedding, top_k, cube_name="memos_cube01"
+    ):
+        """Retrieve and rerank from LongTermMemory and UserMemory"""
+        results = self.graph_retriever.retrieve_from_cube(
+            query_embedding=query_embedding,
             top_k=top_k * 2,
+            memory_scope="LongTermMemory",
+            cube_name=cube_name,
+            user_name=cube_name,
+        )
+        return self.reranker.rerank(
+            query=query,
+            query_embedding=query_embedding[0],
+            graph_results=results,
+            top_k=top_k,
             parsed_goal=parsed_goal,
         )
 
     # --- Path C
     @timed
     def _retrieve_from_internet(
-        self, query, parsed_goal, query_embedding, top_k, info, mode, memory_type
+        self,
+        query,
+        parsed_goal,
+        query_embedding,
+        top_k,
+        info,
+        mode,
+        memory_type,
+        user_id: str | None = None,
     ):
         """Retrieve and rerank from Internet source"""
         if not self.internet_retriever or mode == "fast":
@@ -256,8 +403,7 @@ class Searcher:
         final_items = []
         for item, score in sorted_results:
             meta_data = item.metadata.model_dump()
-            if "relativity" not in meta_data:
-                meta_data["relativity"] = score
+            meta_data["relativity"] = score
             final_items.append(
                 TextualMemoryItem(
                     id=item.id,
@@ -268,17 +414,37 @@ class Searcher:
         return final_items
 
     @timed
-    def _update_usage_history(self, items, info):
+    def _update_usage_history(self, items, info, user_name: str | None = None):
         """Update usage history in graph DB"""
         now_time = datetime.now().isoformat()
-        info.pop("chat_history", None)
-        # `info` should be a serializable dict or string
-        usage_record = json.dumps({"time": now_time, "info": info})
-        for item in items:
-            if (
-                hasattr(item, "id")
-                and hasattr(item, "metadata")
-                and hasattr(item.metadata, "usage")
-            ):
-                item.metadata.usage.append(usage_record)
-                self.graph_store.update_node(item.id, {"usage": item.metadata.usage})
+        info_copy = dict(info or {})
+        info_copy.pop("chat_history", None)
+        usage_record = json.dumps({"time": now_time, "info": info_copy})
+        payload = []
+        for it in items:
+            try:
+                item_id = getattr(it, "id", None)
+                md = getattr(it, "metadata", None)
+                if md is None:
+                    continue
+                if not hasattr(md, "usage") or md.usage is None:
+                    md.usage = []
+                md.usage.append(usage_record)
+                if item_id:
+                    payload.append((item_id, list(md.usage)))
+            except Exception:
+                logger.exception("[USAGE] snapshot item failed")
+
+        if payload:
+            self._usage_executor.submit(
+                self._update_usage_history_worker, payload, usage_record, user_name
+            )
+
+    def _update_usage_history_worker(
+        self, payload, usage_record: str, user_name: str | None = None
+    ):
+        try:
+            for item_id, usage_list in payload:
+                self.graph_store.update_node(item_id, {"usage": usage_list}, user_name=user_name)
+        except Exception:
+            logger.exception("[USAGE] update usage failed")
